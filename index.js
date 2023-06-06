@@ -1,13 +1,30 @@
 const express = require('express');
 const cors = require('cors');
 const app = express();
+var jwt = require('jsonwebtoken');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config()
+const stripe = require('stripe')(process.env.DB_PAYMENT_SECRET)
 const port = process.env.PORT || 5000;
 
 // middleware
 app.use(cors());
 app.use(express.json());
+
+const verifyJWT = (req, res, next) => {
+    const authorization = req.headers.authorization;
+    if (!authorization) {
+        return res.status(401).send({ error: true, message: "authorization filed 1" })
+    }
+    const token = authorization.split(' ')[1];
+    jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (error, decoded) => {
+        if (error) {
+            return res.status(401).send({ error: true, message: "authorization filed 2" })
+        }
+        req.decoded = decoded;
+        next();
+    })
+}
 
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fiopcal.mongodb.net/?retryWrites=true&w=majority`;
@@ -25,17 +42,71 @@ const usersCollection = client.db('bistroDb').collection('users');
 const menuCollection = client.db('bistroDb').collection('menu');
 const reviewsCollection = client.db('bistroDb').collection('reviews');
 const cartCollection = client.db('bistroDb').collection('carts');
+const paymentCollection = client.db("bistroDb").collection("payments");
 
 async function run() {
     try {
         // Connect the client to the server	(optional starting in v4.7)
         await client.connect();
+
+        const verifyAdmin = async (req, res, next) => {
+            const email = req.decoded.email;
+            const query = { email: email };
+            const user = await usersCollection.findOne(query);
+            if (user?.role !== 'admin') {
+                return res.status(403).send({ error: true, message: "forbidden message" })
+            }
+            next();
+        }
         // Send a ping to confirm a successful connection
 
 
+
+
+        // jwt relate apis
+        app.post('/jwt', (req, res) => {
+            const user = req.body;
+            const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '1h' });
+            res.send(token)
+        })
+
         // user relate data
-        app.get('/users', async (req, res) => {
+        app.get('/users', verifyJWT, verifyAdmin, async (req, res) => {
             const result = await usersCollection.find().toArray()
+            res.send(result);
+        })
+
+        app.delete('/users/:id', async (req, res) => {
+            const id = req.params.id;
+            const query = { _id: new ObjectId(id) };
+            const result = await usersCollection.deleteOne(query);
+            res.send(result);
+        })
+
+
+        app.post('/users', async (req, res) => {
+            const user = req.body;
+            const query = { email: user.email };
+            const existingUser = await usersCollection.findOne(query);
+            if (existingUser) {
+                return res.send({ message: "User is already exist" });
+            }
+            else {
+                const result = await usersCollection.insertOne(user);
+                res.send(result);
+            }
+        })
+
+        app.get('/users/admin/:email', verifyJWT, async (req, res) => {
+            const email = req.params.email;
+
+            if (req.decoded.email !== email) {
+                return res.send({ admin: false });
+            }
+
+            const query = { email: email };
+            const user = await usersCollection.findOne(query);
+            const result = { admin: user?.role === 'admin' }
             res.send(result);
         })
 
@@ -52,21 +123,79 @@ async function run() {
             res.send(result);
         })
 
-        app.post('/users', async (req, res) => {
-            const user = req.body;
-            const query = { email: user.email };
-            const existingUser = await usersCollection.findOne(query);
-            if (existingUser) {
-                return res.send({ message: "User is already exist" });
-            }
-            const result = await usersCollection.insertOne(user);
-            res.send(result);
-        })
-
         // menu relate apis
         app.get('/menu', async (req, res) => {
             const result = await menuCollection.find().toArray();
             res.send(result);
+        })
+
+        app.post('/menu', verifyJWT, verifyAdmin, async (req, res) => {
+            const newItem = req.body;
+            const result = await menuCollection.insertOne(newItem);
+            res.send(result);
+        })
+
+        app.delete('/menu/:id', verifyJWT, verifyAdmin, async (req, res) => {
+            const id = req.params.id;
+            const query = { _id: new ObjectId(id) };
+            const result = await menuCollection.deleteOne(query);
+            res.send(result)
+        })
+
+
+
+        app.get('/order-stats', async (req, res) => {
+            const pipeline = [
+                {
+                    $lookup: {
+                        from: 'menu',
+                        localField: 'menuItems',
+                        foreignField: '_id',
+                        as: 'menuItemsData'
+                    }
+                },
+                {
+                    $unwind: '$menuItemsData'
+                },
+                {
+                    $group: {
+                        _id: '$menuItemsData.category',
+                        count: { $sum: 1 },
+                        total: { $sum: '$menuItemsData.price' }
+                    }
+                },
+                {
+                    $project: {
+                        category: '$_id',
+                        count: 1,
+                        total: { $round: ['$total', 2] },
+                        _id: 0
+                    }
+                }
+            ];
+
+            const result = await paymentCollection.aggregate(pipeline).toArray()
+            res.send(result)
+
+        })
+
+
+
+
+
+
+        app.get('/admin-stats', verifyJWT, verifyAdmin, async (req, res) => {
+            const menu = await menuCollection.estimatedDocumentCount();
+            const user = await usersCollection.estimatedDocumentCount();
+            const order = await paymentCollection.estimatedDocumentCount();
+            const payments = await paymentCollection.find().toArray();
+            const revenue = payments.reduce((sum, item) => sum + item.price, 0);
+            res.send({
+                menu,
+                user,
+                order,
+                revenue
+            })
         })
 
         // reviews relate apis
@@ -76,20 +205,22 @@ async function run() {
         })
 
         // carts relate apis
-        app.get('/carts', async (req, res) => {
+        app.get('/carts', verifyJWT, async (req, res) => {
             const email = req.query.email;
             if (!email) {
                 res.send([]);
-            } else {
-                const query = { email: email };
-                const result = await cartCollection.find(query).toArray();
-                res.send(result);
             }
+            const decodedEmail = req.decoded.email;
+            if (email !== decodedEmail) {
+                return res.status(401).send({ error: true, message: "unauthorize token or email" })
+            }
+            const query = { email: email };
+            const result = await cartCollection.find(query).toArray();
+            res.send(result);
         })
 
         app.post('/carts', async (req, res) => {
             const item = req.body;
-            console.log(item);
             const result = await cartCollection.insertOne(item);
             res.send(result);
         })
@@ -100,6 +231,37 @@ async function run() {
             const result = await cartCollection.deleteOne(query);
             res.send(result);
         })
+
+
+
+        // payment
+        app.post('/create-payment-intent', verifyJWT, async (req, res) => {
+            const { price } = req.body;
+            const amount = parseInt(price * 100);
+            console.log('price or amount', price, amount);
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: amount,
+                currency: 'usd',
+                payment_method_types: [
+                    "card"
+                ],
+            })
+            res.send({
+                clientSecret: paymentIntent.client_secret
+            })
+        })
+
+        // payment relate apis
+
+        app.post('/payment', verifyJWT, async (req, res) => {
+            const payment = req.body;
+            const result = await paymentCollection.insertOne(payment);
+            const query = { _id: { $in: payment.cartItemsId.map(id => new ObjectId(id)) } };
+            const deleteResult = await cartCollection.deleteMany(query);
+            res.send({ result, deleteResult });
+        })
+
+
 
         await client.db("admin").command({ ping: 1 });
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
