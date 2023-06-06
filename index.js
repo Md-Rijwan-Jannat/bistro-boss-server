@@ -180,10 +180,6 @@ async function run() {
         })
 
 
-
-
-
-
         app.get('/admin-stats', verifyJWT, verifyAdmin, async (req, res) => {
             const menu = await menuCollection.estimatedDocumentCount();
             const user = await usersCollection.estimatedDocumentCount();
